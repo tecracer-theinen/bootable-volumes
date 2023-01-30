@@ -1,0 +1,74 @@
+#!/usr/bin/env ruby
+
+require 'aws-sdk-ebs'
+require 'aws-sdk-ec2'
+require 'json'
+require 'optparse'
+
+require_relative '../src/filesystem/gpt_partition_table'
+require_relative '../src/filesystem/mbr_partition_table'
+
+def ebs_volumes
+  $ec2_client.describe_volumes.volumes
+end
+
+def snapshots_for_volume(volume_id)
+  snapshots = $ec2_client.describe_snapshots(filters: [{ name: 'volume-id', values: [volume_id] }]).snapshots
+  snapshots.sort_by(&:start_time).reverse
+end
+
+def latest_block_zero(snapshots)
+  snapshots.each do |snapshot|
+    snapshot_id = snapshot.snapshot_id
+    blocks = $ebs_client.list_snapshot_blocks(snapshot_id: snapshot_id).blocks
+
+    found = blocks.detect { |block| block.block_index.zero? }
+    return { snapshot_id: snapshot_id, block: found } if found
+  end
+end
+
+def get_block(snapshot_id, block_token, block_index = 0)
+  {
+    snapshot_id: snapshot_id,
+    block: $ebs_client.get_snapshot_block(snapshot_id: snapshot_id, block_index: block_index, block_token: block_token)
+  }
+end
+
+def bootable?(partition_table)
+  case partition_table
+  when MbrPartitionTable
+    partition_table.partitions.any? { |partition| partition.status == 0x80 }
+  when GptPartitionTable
+    # TODO: No GPT AMIs yet
+  end
+end
+
+###############
+
+$ec2_client = Aws::EC2::Client.new
+$ebs_client = Aws::EBS::Client.new
+
+data = {}
+
+ebs_volumes.each do |volume|
+  volume_id = volume.volume_id
+  snapshots = snapshots_for_volume(volume_id)
+  if snapshots.empty?
+    data[volume_id] = { type: 'unknown' }
+    next
+  end
+
+  latest     = latest_block_zero(snapshots)
+  block_zero = get_block(latest[:snapshot_id], latest[:block].block_token)
+
+  raw_data = Kaitai::Struct::Stream.new(block_zero[:block].block_data.string)
+  begin
+    partition_table = MbrPartitionTable.new(raw_data)
+  rescue Kaitai::Struct::ValidationNotEqualError => _e
+    partition_table = GptPartitionTable.new(raw_data)
+  end
+
+  data[volume_id] = { type: bootable?(partition_table) ? 'root' : 'data' }
+end
+
+print data.to_json
